@@ -12,6 +12,7 @@ import (
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"net/url"
+	"strings"
 )
 
 // EndpointResolverOptions is the service endpoint resolver options
@@ -45,6 +46,27 @@ func resolveDefaultEndpointConfiguration(o *Options) {
 	o.EndpointResolver = NewDefaultEndpointResolver()
 }
 
+// EndpointResolverFromURL returns an EndpointResolver configured using the
+// provided endpoint url. By default, the resolved endpoint resolver uses the
+// client region as signing region, and the endpoint source is set to
+// EndpointSourceCustom.You can provide functional options to configure endpoint
+// values for the resolved endpoint.
+func EndpointResolverFromURL(url string, optFns ...func(*aws.Endpoint)) EndpointResolver {
+	e := aws.Endpoint{URL: url, Source: aws.EndpointSourceCustom}
+	for _, fn := range optFns {
+		fn(&e)
+	}
+
+	return EndpointResolverFunc(
+		func(region string, options EndpointResolverOptions) (aws.Endpoint, error) {
+			if len(e.SigningRegion) == 0 {
+				e.SigningRegion = region
+			}
+			return e, nil
+		},
+	)
+}
+
 type ResolveEndpoint struct {
 	Resolver EndpointResolver
 	Options  EndpointResolverOptions
@@ -66,8 +88,11 @@ func (m *ResolveEndpoint) HandleSerialize(ctx context.Context, in middleware.Ser
 		return out, metadata, fmt.Errorf("expected endpoint resolver to not be nil")
 	}
 
+	eo := m.Options
+	eo.Logger = middleware.GetLogger(ctx)
+
 	var endpoint aws.Endpoint
-	endpoint, err = m.Resolver.ResolveEndpoint(awsmiddleware.GetRegion(ctx), m.Options)
+	endpoint, err = m.Resolver.ResolveEndpoint(awsmiddleware.GetRegion(ctx), eo)
 	if err != nil {
 		return out, metadata, fmt.Errorf("failed to resolve service endpoint, %w", err)
 	}
@@ -84,6 +109,7 @@ func (m *ResolveEndpoint) HandleSerialize(ctx context.Context, in middleware.Ser
 		}
 		ctx = awsmiddleware.SetSigningName(ctx, signingName)
 	}
+	ctx = awsmiddleware.SetEndpointSource(ctx, endpoint.Source)
 	ctx = smithyhttp.SetHostnameImmutable(ctx, endpoint.HostnameImmutable)
 	ctx = awsmiddleware.SetSigningRegion(ctx, endpoint.SigningRegion)
 	ctx = awsmiddleware.SetPartitionID(ctx, endpoint.PartitionID)
@@ -102,7 +128,7 @@ func removeResolveEndpointMiddleware(stack *middleware.Stack) error {
 }
 
 type wrappedEndpointResolver struct {
-	awsResolver aws.EndpointResolver
+	awsResolver aws.EndpointResolverWithOptions
 	resolver    EndpointResolver
 }
 
@@ -110,7 +136,7 @@ func (w *wrappedEndpointResolver) ResolveEndpoint(region string, options Endpoin
 	if w.awsResolver == nil {
 		goto fallback
 	}
-	endpoint, err = w.awsResolver.ResolveEndpoint(ServiceID, region)
+	endpoint, err = w.awsResolver.ResolveEndpoint(ServiceID, region, options)
 	if err == nil {
 		return endpoint, nil
 	}
@@ -126,13 +152,49 @@ fallback:
 	return w.resolver.ResolveEndpoint(region, options)
 }
 
-// withEndpointResolver returns an EndpointResolver that first delegates endpoint
-// resolution to the awsResolver. If awsResolver returns aws.EndpointNotFoundError
-// error, the resolver will use the the provided fallbackResolver for resolution.
-// awsResolver and fallbackResolver must not be nil
-func withEndpointResolver(awsResolver aws.EndpointResolver, fallbackResolver EndpointResolver) EndpointResolver {
+type awsEndpointResolverAdaptor func(service, region string) (aws.Endpoint, error)
+
+func (a awsEndpointResolverAdaptor) ResolveEndpoint(service, region string, options ...interface{}) (aws.Endpoint, error) {
+	return a(service, region)
+}
+
+var _ aws.EndpointResolverWithOptions = awsEndpointResolverAdaptor(nil)
+
+// withEndpointResolver returns an EndpointResolver that first delegates endpoint resolution to the awsResolver.
+// If awsResolver returns aws.EndpointNotFoundError error, the resolver will use the the provided
+// fallbackResolver for resolution.
+//
+// fallbackResolver must not be nil
+func withEndpointResolver(awsResolver aws.EndpointResolver, awsResolverWithOptions aws.EndpointResolverWithOptions, fallbackResolver EndpointResolver) EndpointResolver {
+	var resolver aws.EndpointResolverWithOptions
+
+	if awsResolverWithOptions != nil {
+		resolver = awsResolverWithOptions
+	} else if awsResolver != nil {
+		resolver = awsEndpointResolverAdaptor(awsResolver.ResolveEndpoint)
+	}
+
 	return &wrappedEndpointResolver{
-		awsResolver: awsResolver,
+		awsResolver: resolver,
 		resolver:    fallbackResolver,
 	}
+}
+
+func finalizeClientEndpointResolverOptions(options *Options) {
+	options.EndpointOptions.LogDeprecated = options.ClientLogMode.IsDeprecatedUsage()
+
+	if len(options.EndpointOptions.ResolvedRegion) == 0 {
+		const fipsInfix = "-fips-"
+		const fipsPrefix = "fips-"
+		const fipsSuffix = "-fips"
+
+		if strings.Contains(options.Region, fipsInfix) ||
+			strings.Contains(options.Region, fipsPrefix) ||
+			strings.Contains(options.Region, fipsSuffix) {
+			options.EndpointOptions.ResolvedRegion = strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(
+				options.Region, fipsInfix, "-"), fipsPrefix, ""), fipsSuffix, "")
+			options.EndpointOptions.UseFIPSEndpoint = aws.FIPSEndpointStateEnabled
+		}
+	}
+
 }
